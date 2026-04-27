@@ -172,17 +172,39 @@ class GameState:
         poison = room["night_actions"]["witch_poison"]
         saved = room["night_actions"]["witch_save"]
         deaths = []
+        hunter_died = False
+        hunter_player_id = None
+        
         if victim and not saved:
             target = self.find_player(room, victim)
             if target and target["alive"]:
                 target["alive"] = False
                 deaths.append(target["name"])
+                if target["role"] == "hunter":
+                    hunter_died = True
+                    hunter_player_id = target["id"]
         if poison:
             target = self.find_player(room, poison)
             if target and target["alive"]:
                 target["alive"] = False
                 deaths.append(target["name"])
+                if target["role"] == "hunter":
+                    hunter_died = True
+                    hunter_player_id = target["id"]
+        
         room["night_result"] = deaths
+        
+        # 如果猎人夜晚死亡，进入开枪阶段
+        if hunter_died:
+            room["phase"] = "hunter_shoot"
+            room["hunter_player"] = hunter_player_id
+            room["message"] = "猎人昨夜死亡，请选择开枪带走一名玩家。"
+            if deaths:
+                room["logs"].append("昨夜死亡：" + "、".join(deaths))
+            room["logs"].append("猎人可以开枪带走一名玩家！")
+            return
+        
+        # 正常进入白天
         room["phase"] = "day_discussion"
         room["message"] = f"第 {room['day']} 天白天开始。"
         if deaths:
@@ -213,15 +235,53 @@ class GameState:
         max_votes = max(tally.values())
         top = [pid for pid, c in tally.items() if c == max_votes]
         if len(top) > 1:
-            room["logs"].append("投票平票，无人被放逐。")
+            # 平票：进入PK轮
+            room["logs"].append(f"投票平票！得票最高的玩家有 {len(top)} 人，进入PK轮。")
+            room["phase"] = "day_pk"
+            room["pk_candidates"] = top
+            room["votes"] = {}
+            room["message"] = "平票，请在以下候选人中投票选择放逐对象。"
         else:
             target = self.find_player(room, top[0])
             if target and target["alive"]:
-                target["alive"] = False
-                room["logs"].append(f"{target['name']} 被投票放逐，身份是 {ROLE_NAME[target['role']]}。")
+                self.exile_player(room, target)
+        if room["phase"] != "day_pk":
+            if self.check_winner(room):
+                return
+            self.next_night(room)
+
+    def resolve_pk(self, room):
+        """处理PK轮投票"""
+        tally = {}
+        for target in room["votes"].values():
+            tally[target] = tally.get(target, 0) + 1
+        if not tally:
+            room["logs"].append("PK轮无人投票，本轮无人被放逐。")
+            self.next_night(room)
+            return
+        max_votes = max(tally.values())
+        top = [pid for pid, c in tally.items() if c == max_votes]
+        if len(top) > 1:
+            room["logs"].append("PK轮依然平票，本轮无人被放逐。")
+        else:
+            target = self.find_player(room, top[0])
+            if target and target["alive"]:
+                self.exile_player(room, target)
         if self.check_winner(room):
             return
         self.next_night(room)
+
+    def exile_player(self, room, player):
+        """放逐玩家，处理猎人开枪"""
+        player["alive"] = False
+        room["logs"].append(f"{player['name']} 被投票放逐，身份是 {ROLE_NAME[player['role']]}。")
+        
+        # 如果是猎人，进入开枪阶段
+        if player["role"] == "hunter":
+            room["phase"] = "hunter_shoot"
+            room["hunter_player"] = player["id"]
+            room["message"] = f"猎人 {player['name']} 被放逐，请选择开枪带走一名玩家。"
+            room["logs"].append(f"猎人 {player['name']} 可以开枪带走一名玩家！")
 
     def next_night(self, room):
         room["day"] += 1
@@ -450,6 +510,17 @@ function renderPhasePanel(state) {
   } else if (state.phase === 'day_vote') {
     html += '<div>投票放逐一名玩家：</div>';
     html += buildTargetButtons(optionPlayers(state, false), 'vote', '投票');
+  } else if (state.phase === 'day_pk') {
+    html += '<div>⚔️ PK轮投票：请在以下候选人中选择放逐对象</div>';
+    const pkCandidates = state.players.filter(p => state.pk_candidates && state.pk_candidates.includes(p.id));
+    html += buildTargetButtons(pkCandidates, 'pk_vote', 'PK投票');
+  } else if (state.phase === 'hunter_shoot') {
+    if (state.hunter_player === me.id) {
+      html += '<div>🏹 猎人开枪：你已出局，请选择开枪带走一名玩家</div>';
+      html += buildTargetButtons(optionPlayers(state, false), 'hunter_shoot', '开枪');
+    } else {
+      html = '<div>猎人正在选择开枪目标，请等待...</div>';
+    }
   }
 
   panel.innerHTML = html;
@@ -598,6 +669,8 @@ def build_state(room, player):
             "night_witch": "夜晚：女巫",
             "day_discussion": "白天：讨论",
             "day_vote": "白天：投票",
+            "day_pk": "白天：PK轮",
+            "hunter_shoot": "猎人开枪",
             "ended": "结算",
         }.get(room["phase"], room["phase"]),
         "message": room["message"],
@@ -619,6 +692,8 @@ def build_state(room, player):
         "witch_can_save": player["role"] == "witch" and not room["night_actions"]["used_save"] and bool(victim_name),
         "witch_can_poison": player["role"] == "witch" and not room["night_actions"]["used_poison"],
         "night_victim_name": victim_name,
+        "pk_candidates": room.get("pk_candidates", []),
+        "hunter_player": room.get("hunter_player"),
     }
 
 
@@ -715,6 +790,48 @@ def handle_action(room_id, player_id, action, target_id):
         alive_count = len([p for p in room["players"] if p["alive"]])
         if len(room["votes"]) >= alive_count:
             STATE.resolve_vote(room)
+        return None
+
+    if action == "pk_vote":
+        if room["phase"] != "day_pk":
+            return "当前不是PK阶段"
+        if target_id not in room.get("pk_candidates", []):
+            return "只能投票给PK候选人"
+        target = STATE.find_player(room, target_id)
+        if not target or not target["alive"]:
+            return "投票目标无效"
+        room["votes"][player_id] = target_id
+        room["logs"].append(f"{player['name']} 已在PK轮投票。")
+        alive_count = len([p for p in room["players"] if p["alive"]])
+        if len(room["votes"]) >= alive_count:
+            STATE.resolve_pk(room)
+        return None
+
+    if action == "hunter_shoot":
+        if room["phase"] != "hunter_shoot":
+            return "当前不是猎人开枪阶段"
+        if room.get("hunter_player") != player_id:
+            return "只有猎人可以开枪"
+        target = STATE.find_player(room, target_id)
+        if not target or not target["alive"]:
+            return "开枪目标无效"
+        target["alive"] = False
+        room["logs"].append(f"猎人开枪带走了 {target['name']}，身份是 {ROLE_NAME[target['role']]}。")
+        # 检查胜负
+        if STATE.check_winner(room):
+            return None
+        # 继续进入夜晚或白天
+        if "night" in room.get("prev_phase", "day"):
+            # 如果是夜晚死的，继续进入白天
+            room["phase"] = "day_discussion"
+            room["message"] = f"第 {room['day']} 天白天开始。"
+            room["order"] = [p["id"] for p in STATE.living_players(room)]
+            room["current_speaker_index"] = 0
+            room["speaker_done"] = False
+            room["votes"] = {}
+        else:
+            # 如果是白天死的，进入夜晚
+            STATE.next_night(room)
         return None
 
     return "未知操作"
